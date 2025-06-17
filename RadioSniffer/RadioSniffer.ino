@@ -23,14 +23,18 @@
 #define rxPin 2         // выход приемника int0
 #define RVR_Vcc_Pin 4   // включение питания приемника
 #define txPin 9         // вход передатчика
+//#define TM_EN_Pin 12    // EN передачика
 #define TM_Vcc_Pin 8    // питание передачика
 #define TM_gnd_Pin 7    // земля передатчика
 #define speakerPin 10   // Спикер, он же buzzer, он же beeper
-#define spr_gnd_Pin 11  // Земля спикера
+#define spr_gnd_Pin 12  // Земля спикера
 #define G_Led 13        // всроенный свеодиод
 #define Btn_ok_Pin 3    // Кнопка оправки текущего кода
 #define Btn_left_Pin 5  // Кнопка влево
 #define Btn_right_Pin 6 // Кнопка вправо
+
+bool isDeleting = false;
+unsigned long deleteStartTime = 0;
 
 GButton btn_ok(Btn_ok_Pin);       // кнопка ОК
 GButton btn_left(Btn_left_Pin);   // кнопка влево
@@ -45,7 +49,7 @@ volatile byte logLen;                 // фактическая длинна л�
 volatile bool SleepOn = false;        // режим энергосережения
 
 enum emKeys {kUnknown, kP12bt, k12bt, k24bt, k64bt, kKeeLoq, kANmotors64};    // тип оригинального ключа
-enum emSnifferMode {smdNormal, smdAutoRec, smdAutoRecSilence} snifferMode;          // режим раоы сниффера
+enum emSnifferMode {smdNormal, smdManual, smdAutoRec, smdAutoRecSilence} snifferMode;          // режим раоы сниффера
 
 struct tpKeyRawData{  
   byte keyID[9];            // шифр ключа 12-66 bit
@@ -84,6 +88,7 @@ void OLED_printKey(tpKeyData* kd, byte msgType = 0){
   String st;
   switch (snifferMode){
     case smdNormal: myOLED.clrScr(); myOLED.print("N", RIGHT, 24); break; 
+    case smdManual: myOLED.clrScr(); myOLED.print("M", RIGHT, 24); break;  
     case smdAutoRec: myOLED.clrScr(); myOLED.print("A", RIGHT, 24); break; 
     case smdAutoRecSilence: return; 
   }
@@ -104,6 +109,7 @@ void OLED_printKey(tpKeyData* kd, byte msgType = 0){
 void OLED_printError(String st, bool err = true){
   switch (snifferMode){
     case smdNormal: myOLED.clrScr(); myOLED.print("N", RIGHT, 24); break; 
+    case smdManual: myOLED.clrScr(); myOLED.print("M", RIGHT, 24); break;  
     case smdAutoRec: myOLED.clrScr(); myOLED.print("A", RIGHT, 24); break; 
     case smdAutoRecSilence: return; 
   }
@@ -171,6 +177,7 @@ void setup() {
   btn_right.setStepTimeout(200 >> prescal);
   btn_left.setTickMode(AUTO);
   btn_right.setTickMode(AUTO);
+   //pinMode(TM_EN_Pin, OUTPUT); digitalWrite(TM_EN_Pin, HIGH);
   pinMode(RVR_Vcc_Pin, OUTPUT); digitalWrite(RVR_Vcc_Pin, HIGH);  // включение питания приемника
   pinMode(TM_gnd_Pin, OUTPUT); digitalWrite(TM_gnd_Pin, LOW); // земля передатчика
   pinMode(TM_Vcc_Pin, OUTPUT); digitalWrite(TM_Vcc_Pin, LOW); // питание передачика отключено
@@ -183,7 +190,7 @@ void setup() {
   myOLED.clrScr();                                          //Очищаем буфер дисплея.
   myOLED.setFont(SmallFont);                                //Перед выводом текста необходимо выбрать шрифт
   myOLED.print(F("Hello, read a key..."), LEFT, 0);
-  const char st[16] = {98, 121, 32, 77, 69, 88, 65, 84, 80, 79, 72, 32, 68, 73, 89, 0};
+  const char st[13] = {98, 121, 32, 82, 97, 100, 105, 111, 109, 101, 114, 122, 0};
   myOLED.print(st, LEFT, 24);
   myOLED.update();
   snifferMode = smdNormal;
@@ -221,6 +228,7 @@ String getTypeName(emKeys tp){
     case kP12bt: return F(" Pre 12bit");
     case k12bt: return F(" 12bit");
     case k24bt: return F(" 24bit");
+    case k64bt: return F(" 64bit");
     case kKeeLoq: return F(" KeeLoq");
     case kANmotors64: return F(" ANmotors");
   }
@@ -402,7 +410,7 @@ void sendSynthKey(tpKeyData* kd){
     sendSynthBit(kd->midlePause);
     byte j = 0, bt; 
     for (byte i = 0; i < kd->codeLenth; i++){
-      if ( ((i>>3) >= 2) && ((i>>3) <= 3)&&(kd->type == kANmotors64)) bt = 1&(ANmotorsByte >> (7-j)); // заменяем 2 и 3 айты на случайное число для ANmotors 
+      if ( ((i>>3) >= 2) && ((i>>3) <= 3)&&(kd->type == kANmotors64)) bt = 1&(ANmotorsByte >> (7-j)); // заменяем 2 и 3 байты на случайное число для ANmotors 
         else bt = 1&(kd->keyID[i >> 3] >> (7-j));
       if (bt) sendSynthBit(kd->one);
         else sendSynthBit(kd->zero);
@@ -413,6 +421,33 @@ void sendSynthKey(tpKeyData* kd){
   digitalWrite(TM_Vcc_Pin, LOW); // выключаем передачик
   digitalWrite(RVR_Vcc_Pin, HIGH);  //включаем приемник
   recieved = false;
+}
+
+void deleteKeyFromEEPROM(){
+  if (EEPROM_key_count > 0) {
+    EEPROM_key_count--;  // Reduce the count of stored keys
+    Serial.println(F("Deleting current key from EEPROM"));
+
+    // Shift remaining keys in EEPROM
+    for (byte i = EEPROM_key_index; i < EEPROM_key_count; i++) {
+      tpKeyData tempKey;
+      EEPROM_get_key(i + 1, &tempKey);
+      EEPROM.put(i * sizeof(tpKeyData), tempKey);
+    }
+
+    // Update EEPROM values
+    EEPROM.update(0, EEPROM_key_count);
+    EEPROM.update(1, EEPROM_key_index > EEPROM_key_count ? EEPROM_key_count : EEPROM_key_index);
+    
+    OLED_printError(F("Key deleted!"), false);
+    delay(200);
+    myOLED.clrScr();
+    if (EEPROM_key_count == 0)
+    {
+       myOLED.print(F("ROM has no keys yet."), 0, 12);
+    }
+    myOLED.update();
+  }
 }
 
 void printDebugData(){
@@ -465,16 +500,20 @@ void go2sleep(){
 
 void loop() {
   btn_ok.tick(); btn_left.tick(); btn_right.tick();
-  char echo = Serial.read(); if (echo > 0) Serial.println(echo);
-  if ((echo == 'e') || (btn_left.isHold() && btn_right.isHold())){
-    myOLED.print(F("EEPROM cleared success!"), 0, 0);
-    Serial.println(F("EEPROM cleared"));
-    EEPROM.update(0, 0); EEPROM.update(1, 0);
-    EEPROM_key_count = 0; EEPROM_key_index = 0;
-    Sd_ReadOK();
-    myOLED.update();
-    stTimer = millis();
+  if (btn_left.isHold() && btn_right.isHold()) {
+    deleteKeyFromEEPROM();
+    stTimer = millis(); // Reset sleep timer
   }
+  char echo = Serial.read(); if (echo > 0) Serial.println(echo);
+//  if ((echo == 'e') || (btn_left.isHold() && btn_right.isHold())){
+//    myOLED.print(F("EEPROM cleared success!"), 0, 0);
+//    Serial.println(F("EEPROM cleared"));
+//    EEPROM.update(0, 0); EEPROM.update(1, 0);
+//    EEPROM_key_count = 0; EEPROM_key_index = 0;
+//    Sd_ReadOK();
+//    myOLED.update();
+//    stTimer = millis();
+//  }
   bool dcl = btn_ok.isDouble();
   if ((echo == 't') || (btn_ok.isClick() && !dcl)) {  // отправляем ключ
     sendSynthKey(&keyData1);
@@ -491,7 +530,7 @@ void loop() {
     stTimer = millis();
     //Serial.println("L");
   }
-  if (btn_right.isClick() && (EEPROM_key_count > 0)){
+  if (btn_right.isClick() && (EEPROM_key_count > 0) && !isDeleting){
     EEPROM_key_index++;
     if (EEPROM_key_index > EEPROM_key_count) EEPROM_key_index = 1;
     EEPROM_get_key(EEPROM_key_index, &keyData1);
@@ -502,7 +541,8 @@ void loop() {
   }
   if (dcl) {
     switch (snifferMode){
-      case smdNormal: snifferMode = smdAutoRec; OLED_printKey(&keyData1); Sd_ReadOKK(); Sd_ReadOK(); break; 
+      case smdNormal: snifferMode = smdManual; OLED_printKey(&keyData1); Sd_ReadOKK(); Sd_ReadOK(); break; 
+      case smdManual: snifferMode = smdAutoRec; OLED_printKey(&keyData1); Sd_ReadOKK(); Sd_ReadOK(); break; 
       case smdAutoRec: Sd_ReadOKK(); Sd_ReadOK(); snifferMode = smdAutoRecSilence; myOLED.sleepMode(SLEEP_ON); break; 
       case smdAutoRecSilence: snifferMode = smdNormal; myOLED.sleepMode(SLEEP_OFF); OLED_printKey(&keyData1); Sd_ReadOKK(); Sd_ReadOK(); break; 
     }
@@ -531,13 +571,18 @@ void loop() {
       }
     } else Sd_ErrorBeep();
     if (snifferMode != smdAutoRecSilence) printDebugData();
-    if ((snifferMode != smdNormal) && (keyData1.codeLenth != 0)){
-      if (EPPROM_AddKey(&keyData1)) {
-        OLED_printError(F("The key saved"), false);
-        Sd_ReadOKK();
-        delay(500 >> prescal); 
-      } else Sd_ErrorBeep();
-      OLED_printKey(&keyData1);
+    if ((snifferMode != smdNormal) && (keyData1.codeLenth != 0))
+    {
+      if (snifferMode != smdManual)
+      {
+        if (EPPROM_AddKey(&keyData1))
+          {
+            OLED_printError(F("The key saved"), false);
+            Sd_ReadOKK();
+            delay(500 >> prescal); 
+          } else Sd_ErrorBeep();
+        OLED_printKey(&keyData1);
+      }
     }
     stTimer = millis();
     recieved = false;
